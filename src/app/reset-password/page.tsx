@@ -1,11 +1,13 @@
 'use client';
-// Supabase 비밀번호 복구 링크 전용 페이지. 일반 로그인 세션만으로 변경 폼을 열지 않는다.
+// 비밀번호 복구 링크에 포함된 인증 정보만으로 변경 화면을 연다.
+// 기존 로그인 세션만으로는 비밀번호 변경 화면을 열지 않는다.
 import React, { useEffect, useState } from 'react';
 import { loadServerConfig } from '@/lib/serverConfig';
 import { KInput } from '@/components/ui/Kit';
+import type { SupabaseClient } from '@supabase/supabase-js';
 
 export default function ResetPasswordPage() {
-  const [client, setClient] = useState<import('@supabase/supabase-js').SupabaseClient | null>(null);
+  const [client, setClient] = useState<SupabaseClient | null>(null);
   const [status, setStatus] = useState<'loading' | 'ready' | 'invalid' | 'done'>('loading');
   const [error, setError] = useState('');
   const [password, setPassword] = useState('');
@@ -13,48 +15,62 @@ export default function ResetPasswordPage() {
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    let alive = true;
-    let unsubscribe: (() => void) | undefined;
+    let active = true;
     const boot = async () => {
       try {
+        const search = new URLSearchParams(window.location.search);
+        const fragment = new URLSearchParams(window.location.hash.slice(1));
+        const code = search.get('code');
+        const tokenHash = search.get('token_hash');
+        const type = search.get('type') ?? fragment.get('type');
+        const accessToken = fragment.get('access_token');
+        const refreshToken = fragment.get('refresh_token');
+
+        // 링크를 통한 복구만 허용. 이미 로그인한 사용자의 일반 세션은 허용하지 않음.
+        const isPkce = Boolean(code);
+        const isOtp = Boolean(tokenHash && type === 'recovery');
+        const isImplicit = type === 'recovery' && Boolean(accessToken && refreshToken);
+        if (!isPkce && !isOtp && !isImplicit) throw new Error('재설정 인증 정보가 없습니다. 새 링크를 요청해 주세요.');
+
         const cfg = await loadServerConfig();
         if (!cfg || cfg.kind !== 'supabase') throw new Error('Supabase 연결 설정을 찾지 못했습니다.');
         const { createBrowserClient } = await import('@supabase/ssr');
-        const sb = createBrowserClient(cfg.url.replace(/\/$/, ''), cfg.anonKey);
-        const params = new URLSearchParams(window.location.search);
-        const hash = new URLSearchParams(window.location.hash.replace(/^#/, ''));
-        const recoveryLink = params.has('code') || params.has('token_hash') || hash.get('type') === 'recovery';
-        if (!recoveryLink) {
-          if (alive) setStatus('invalid');
-          return;
-        }
-        const { data: listener } = sb.auth.onAuthStateChange((event) => {
-          if (event === 'PASSWORD_RECOVERY' && alive) setStatus('ready');
+        // Supabase가 URL의 code를 자동 교환하기 전에 명시적으로 처리한다.
+        // createBrowserClient를 사용해야 메일 요청 때 저장한 PKCE verifier 저장소와 일치한다.
+        const sb = createBrowserClient(cfg.url.replace(/\/$/, ''), cfg.anonKey, {
+          auth: { detectSessionInUrl: false },
         });
-        unsubscribe = () => listener.subscription.unsubscribe();
-        if (params.has('token_hash')) {
-          const { error: verifyError } = await sb.auth.verifyOtp({
-            token_hash: params.get('token_hash')!, type: 'recovery',
-          });
+
+        if (isOtp) {
+          const { error: verifyError } = await sb.auth.verifyOtp({ token_hash: tokenHash!, type: 'recovery' });
           if (verifyError) throw verifyError;
-        } else if (params.has('code')) {
-          // PKCE 코드: 이미 앱 부팅 과정에서 교환되었을 수도 있다.
-          const { data: existing } = await sb.auth.getSession();
-          if (!existing.session) {
-            const { error: exchangeError } = await sb.auth.exchangeCodeForSession(params.get('code')!);
-            if (exchangeError) throw exchangeError;
-          }
+        } else if (isPkce) {
+          // 기존 로그인 세션이 있어도 반드시 복구 code를 교환한다.
+          const { error: exchangeError } = await sb.auth.exchangeCodeForSession(code!);
+          if (exchangeError) throw exchangeError;
+        } else {
+          const { error: setError } = await sb.auth.setSession({
+            access_token: accessToken!, refresh_token: refreshToken!,
+          });
+          if (setError) throw setError;
         }
-        const { data, error: sessionError } = await sb.auth.getSession();
-        if (sessionError || !data.session) throw new Error('복구 인증이 만료되었거나 유효하지 않습니다.');
-        if (alive) { setClient(sb); setStatus('ready'); }
-        window.history.replaceState({}, '', '/reset-password');
+
+        const { data: userData, error: userError } = await sb.auth.getUser();
+        if (userError || !userData.user) throw new Error('복구 인증이 만료되었거나 유효하지 않습니다.');
+        if (!active) return;
+        setClient(sb);
+        setStatus('ready');
+        // 인증 코드가 주소창, 브라우저 기록 등에 남지 않게 제거한다.
+        window.history.replaceState(window.history.state, '', '/reset-password');
       } catch (e) {
-        if (alive) { setError(e instanceof Error ? e.message : '복구 링크를 확인하지 못했습니다.'); setStatus('invalid'); }
+        if (active) {
+          setError(e instanceof Error ? e.message : '복구 링크를 확인하지 못했습니다.');
+          setStatus('invalid');
+        }
       }
     };
     void boot();
-    return () => { alive = false; unsubscribe?.(); };
+    return () => { active = false; };
   }, []);
 
   const submit = async () => {
