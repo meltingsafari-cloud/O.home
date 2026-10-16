@@ -94,7 +94,9 @@ export async function createSupabaseBackend(
     async signOut() { await sb.auth.signOut(); },
 
     async resetPassword(email) {
-      const { error } = await sb.auth.resetPasswordForEmail(email);
+      const { error } = await sb.auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}/reset-password`,
+      });
       return error ? { ok: false, error: error.message } : { ok: true };
     },
 
