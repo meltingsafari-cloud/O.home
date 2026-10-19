@@ -37,6 +37,10 @@ interface AuthCtx {
 
 const Ctx = createContext<AuthCtx | null>(null);
 const MOCK_KEY = 'ohome.mockuser.v1';
+// 탭 단위 인증 방문 기록. 다른 사이트로 떠난 뒤 돌아오면 재인증한다.
+const VISIT_KEY = 'ohome.auth.visit.v1';
+const EXIT_KEY = 'ohome.auth.exited.v1';
+
 const MOCK_REG_KEY = 'ohome.mockreg.v1';
 const INVITE_KEY = 'ohome.invite.v1';    // 가입코드 — 환경설정 > 회원/보안
 const SETUP_KEY = 'ohome.setup.v1';      // 설치 화면을 마쳤는지
@@ -103,28 +107,99 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [ready, setReady] = useState(false);   // 확인이 끝났는지 (v2.0)
 
   useEffect(() => {
-    if (!server || !be) {
-      try {
-        const raw = localStorage.getItem(MOCK_KEY);
-        if (raw) setUser(JSON.parse(raw));
-      } catch { /* 무시 */ }
-      setReady(true);
-      return;
-    }
     let alive = true;
-    void be.currentUser().then(u => { if (alive) { setUser(u as User | null); setReady(true); } });
-    const off = be.onAuthChange(u => { if (alive) { setUser(u as User | null); setReady(true); } });
-    return () => { alive = false; off(); };
+    // pagehide는 사이트 내부의 Next.js 메뉴 이동에는 발생하지 않는다.
+    // 새로고침에도 발생하므로, 다음 진입이 reload이면 기존 인증을 유지한다.
+    const onLeave = () => {
+      try { sessionStorage.setItem(EXIT_KEY, '1'); } catch { /* 무시 */ }
+    };
+    window.addEventListener('pagehide', onLeave);
+
+    const onReturn = (event: PageTransitionEvent) => {
+      // 뒤로 가기로 BFCache의 기존 페이지가 복원되는 경우에는 React가 다시 mount되지 않는다.
+      if (!event.persisted) return;
+      let exited = false;
+      try { exited = sessionStorage.getItem(EXIT_KEY) === '1'; } catch { /* 무시 */ }
+      if (!exited) return;
+      try {
+        sessionStorage.removeItem(VISIT_KEY);
+        sessionStorage.removeItem(EXIT_KEY);
+      } catch { /* 무시 */ }
+      setUser(null);
+      setReady(false);
+      if (server && be) {
+        void be.signOut().catch(() => {}).finally(() => {
+          if (alive) setReady(true);
+        });
+      } else {
+        try { localStorage.removeItem(MOCK_KEY); } catch { /* 무시 */ }
+        setReady(true);
+      }
+    };
+    window.addEventListener('pageshow', onReturn);
+
+    const initialize = async () => {
+      const isReload = performance.getEntriesByType('navigation').some(
+        entry => (entry as PerformanceNavigationTiming).type === 'reload',
+      );
+      let canResume = false;
+      try {
+        const visited = sessionStorage.getItem(VISIT_KEY) === '1';
+        const exited = sessionStorage.getItem(EXIT_KEY) === '1';
+        canResume = visited && (!exited || isReload);
+        sessionStorage.removeItem(EXIT_KEY);
+        if (!canResume) sessionStorage.removeItem(VISIT_KEY);
+      } catch { /* 저장소 차단 시 안전하게 재로그인 */ }
+
+      if (!server || !be) {
+        if (canResume) {
+          try {
+            const raw = localStorage.getItem(MOCK_KEY);
+            if (raw && alive) setUser(JSON.parse(raw));
+          } catch { /* 무시 */ }
+        } else {
+          try { localStorage.removeItem(MOCK_KEY); } catch { /* 무시 */ }
+        }
+        if (alive) setReady(true);
+        return;
+      }
+      if (!canResume) {
+        // 서버 세션도 실제로 종료해야 다음 방문에서 자동 로그인되지 않는다.
+        try { await be.signOut(); } catch { /* 네트워크 실패 시에도 UI는 비로그인 */ }
+        if (alive) { setUser(null); setReady(true); }
+      } else {
+        try {
+          const u = await be.currentUser();
+          if (alive) { setUser(u as User | null); setReady(true); }
+        } catch {
+          if (alive) setReady(true);
+        }
+      }
+      if (!alive) return;
+      off = be.onAuthChange(u => {
+        if (alive) { setUser(u as User | null); setReady(true); }
+      });
+    };
+    let off: (() => void) | undefined;
+    void initialize();
+    return () => {
+      alive = false;
+      off?.();
+      window.removeEventListener('pagehide', onLeave);
+      window.removeEventListener('pageshow', onReturn);
+    };
   }, [server, be]);
 
   const login = useCallback(async (id: string, password: string): Promise<Result> => {
     if (server && be) {
       const r = await be.signIn(id.trim(), password);
+      if (r.ok) { try { sessionStorage.setItem(VISIT_KEY, '1'); sessionStorage.removeItem(EXIT_KEY); } catch { /* 무시 */ } }
       return r.ok ? { ok: true } : { ok: false, error: r.error ?? '로그인에 실패했습니다.' };
     }
     const acc = mockRegistry()[id] ?? (isSetupDone() ? undefined : MOCK_ACCOUNTS[id]);
     if (!acc || acc.password !== password) return { ok: false, error: '아이디 또는 비밀번호가 올바르지 않습니다.' };
     setUser(acc.user);
+    try { sessionStorage.setItem(VISIT_KEY, '1'); sessionStorage.removeItem(EXIT_KEY); } catch { /* 무시 */ }
     try { localStorage.setItem(MOCK_KEY, JSON.stringify(acc.user)); } catch { /* 무시 */ }
     return { ok: true };
   }, [server, be]);
@@ -136,6 +211,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (server && be) {
       const r = await be.signUp(id.trim(), password, nickname.trim());
       if (!r.ok) return { ok: false, error: r.error ?? '가입에 실패했습니다.' };
+      try { sessionStorage.setItem(VISIT_KEY, '1'); sessionStorage.removeItem(EXIT_KEY); } catch { /* 무시 */ }
       // 계정이 만들어지는 순간 로그인 상태가 되며 사용자 정보가 먼저 계산되는데,
       // 그때는 닉네임(프로필)이 아직 저장되기 전이라 이메일이 이름 자리에 들어간다.
       // 저장이 끝난 지금 다시 읽어 이름을 바로잡는다.
@@ -208,6 +284,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [server, be, user]);
 
   const logout = useCallback(async () => {
+    try { sessionStorage.removeItem(VISIT_KEY); sessionStorage.removeItem(EXIT_KEY); } catch { /* 무시 */ }
     if (server && be) { await be.signOut(); setUser(null); return; }
     setUser(null);
     try { localStorage.removeItem(MOCK_KEY); } catch { /* 무시 */ }
